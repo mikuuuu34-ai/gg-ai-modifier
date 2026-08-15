@@ -1,4 +1,4 @@
-[中文文档](README/v2.0.0-cn_README.md) | [English Document](README/v2.0.0-en_README.md) | [历史更新日志](update/)
+[中文文档](README/v3.0.0-cn_README.md) | [English Document](README/v2.0.0-en_README.md) | [**MCP 服务**](README/MCP.md) | [历史更新日志](update/)
 
 ---
 
@@ -25,6 +25,12 @@ GG-AI Modifier 是一个基于 **Flutter + Kotlin** 开发的 Android 游戏内�
 - 支持 Function Calling，AI 自动调用内存操作函数
 - 多轮对话上下文，AI 引导用户逐步定位目标数据
 - Markdown/LaTeX/Mermaid 渲染，AI 回复支持代码高亮和图表
+
+#### 🔌 MCP 服务（接入 Claude Code / Codex）
+- 把内存搜索、读写、冻结开放成 MCP 接口，由外部 AI 客户端驱动
+- Streamable HTTP 传输，默认只绑 `127.0.0.1` + 强制令牌 + 只读模式
+- 搜索只返回结果集 id 与计数，不把几十万个地址灌进对话上下文
+- 详见 [MCP 服务说明](README/MCP.md)
 
 #### 🔍 内存搜索引擎
 - **精确搜索**：搜索指定数值的内存地址
@@ -97,7 +103,7 @@ If you find this project helpful, donations are warmly welcomed~
 **币安 USDT (TRC20) 收款地址**  
 `TXAgg43gZhE62VYHgBEaLt1WXVP8LNYEYP`
 
-![币安 USDT 收款](img/币安收款捐赠usdt.png)
+![币安 USDT 收款](img/usdt.png)
 
 **微信收款 / WeChat Pay**
 
