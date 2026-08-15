@@ -1,0 +1,97 @@
+name: build
+
+on:
+  push:
+    branches: [master, "feat/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 扫描器协议测试。不依赖 Android，在 runner 上直接编 native 版跑，
+  # 一分钟内就能告诉你 C++ 改动有没有破坏协议契约。
+  scanner-protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 编译 scanner_root（宿主机版）
+        run: |
+          g++ -std=c++11 -O2 -Wall -Wextra \
+            -D_GNU_SOURCE -D_LARGEFILE64_SOURCE \
+            android/app/src/main/cpp/scanner_root_optimized.cpp \
+            -o /tmp/scanner_root
+
+      - name: 放开 ptrace 限制
+        # runner 默认 yama ptrace_scope=1，只允许读直系子进程的 /proc/pid/mem，
+        # 而测试里扫描器和靶子是兄弟进程，不放开就全部读失败。
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0
+
+      - name: 跑协议测试
+        run: python3 tools/scanner_test/test_scanner.py /tmp/scanner_root
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: 环境信息
+        run: |
+          flutter --version
+          java -version
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/ndk" 2>/dev/null || echo "(尚未安装 NDK，交给 Gradle 自动拉取)"
+
+      - name: 接受 Android SDK 许可
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - run: flutter pub get
+
+      - name: 记录构建前 assets 内二进制哈希
+        run: |
+          sha256sum android/app/src/main/assets/native/*/scanner_root | sort -k2 > /tmp/before.txt
+          cat /tmp/before.txt
+
+      - name: 构建 Release APK
+        run: flutter build apk --release
+
+      - name: 校验 scanner_root 确实被重新编译并打进 APK
+        # build.gradle.kts 原先只把 copyScannerRoot 挂在 debug 任务上，
+        # release 构建会静默打包仓库里那份陈旧的预编译二进制，
+        # 导致所有 C++ 改动都不生效。这一步就是防止那种情况回归。
+        run: |
+          sha256sum android/app/src/main/assets/native/*/scanner_root | sort -k2 > /tmp/after.txt
+          cat /tmp/after.txt
+          if diff -q /tmp/before.txt /tmp/after.txt > /dev/null; then
+            echo "::error::assets 里的 scanner_root 与仓库提交的完全一致，说明 copyScannerRoot 未在 release 构建生效，APK 内仍是旧二进制"
+            exit 1
+          fi
+
+          APK=$(find build -name 'app-release.apk' | head -1)
+          echo "APK=$APK"
+          IN_APK=$(unzip -p "$APK" assets/native/arm64-v8a/scanner_root | sha256sum | cut -d' ' -f1)
+          ON_DISK=$(sha256sum android/app/src/main/assets/native/arm64-v8a/scanner_root | cut -d' ' -f1)
+          echo "APK 内:   $IN_APK"
+          echo "assets 内: $ON_DISK"
+          if [ "$IN_APK" != "$ON_DISK" ]; then
+            echo "::error::APK 里打包的 scanner_root 不是刚编出来的那份"
+            exit 1
+          fi
+          echo "✅ 新编译的 scanner_root 已正确打进 APK"
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error

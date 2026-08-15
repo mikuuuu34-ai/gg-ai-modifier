@@ -6,349 +6,495 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.*
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
- * Root Scanner - 通过独立可执行文件进行内存扫描
- * 
- * 设计：
- * - scanner_root 可执行文件通过 su 以 root 权限运行
- * - 使用 process_vm_readv/writev 系统调用（有 CAP_SYS_PTRACE）
- * - 通过 stdin/stdout 进行 JSON 通信
- * - 异步执行，不阻塞 UI 线程
+ * Root Scanner —— 与 scanner_root (协议 v2) 的 JSON 行式通道
+ *
+ * 相比旧版的三处关键变化：
+ *
+ * 1. 串行化：sendCommand 全程持有 ioLock。旧版「写一行读一行」没有任何同步，
+ *    单线程 UI 下侥幸没暴露，MCP 服务器一旦并发就会串包（A 请求拿到 B 的响应）。
+ * 2. 读取超时：响应由独立线程泵进队列，poll 超时即判定扫描器失联并自动重启，
+ *    不再像旧版那样 readLine() 无限阻塞。
+ * 3. 结果集留在扫描器进程里：搜索只回 setId/count，按页取结果，
+ *    不再把百万地址塞进一行 JSON。
  */
 object RootScanner {
-    
+
     private const val TAG = "RootScanner"
     private const val SCANNER_NAME = "scanner_root"
-    
+
+    /** 单条命令最长等待。大范围扫描可能耗时数十秒，留足余量 */
+    private const val DEFAULT_TIMEOUT_MS = 180_000L
+    private const val QUICK_TIMEOUT_MS = 15_000L
+
+    private val ioLock = ReentrantLock()
+
     private var scannerProcess: Process? = null
     private var scannerWriter: BufferedWriter? = null
-    private var scannerReader: BufferedReader? = null
-    
-    /**
-     * 初始化 Root Scanner（部署可执行文件并启动）
-     */
+    private var responses: LinkedBlockingQueue<String>? = null
+    private var pumpThread: Thread? = null
+    private var scannerPath: String? = null
+
+    @Volatile
+    private var lastError: String? = null
+
+    fun getLastError(): String? = lastError
+
+    fun isRunning(): Boolean = ioLock.withLock { scannerProcess != null }
+
+    // ==================== 数据结构 ====================
+
+    data class SearchResult(
+        val setId: Int,
+        val count: Int,
+        val truncated: Boolean,
+        val elapsedMs: Long
+    )
+
+    data class ResultItem(
+        val address: Long,
+        val valueBytes: ByteArray?,
+        val machineCode: String?
+    )
+
+    data class ResultPage(
+        val setId: Int,
+        val total: Int,
+        val offset: Int,
+        val type: String,
+        val items: List<ResultItem>
+    )
+
+    data class SetInfo(val id: Int, val count: Int, val type: String)
+
+    // ==================== 生命周期 ====================
+
     suspend fun initialize(context: Context): Boolean = withContext(Dispatchers.IO) {
-        try {
-            // 1. 从 assets 或 native lib 目录复制可执行文件到 /data/local/tmp
-            val scannerPath = extractScanner(context)
-            if (scannerPath == null) {
-                Log.e(TAG, "Failed to extract scanner executable")
-                return@withContext false
-            }
-            
-            // 2. 通过 su 启动 scanner_root
-            val suProcess = Runtime.getRuntime().exec("su")
-            val suWriter = BufferedWriter(OutputStreamWriter(suProcess.outputStream))
-            
-            // 设置权限并启动
-            suWriter.write("chmod 755 $scannerPath\n")
-            suWriter.write("$scannerPath\n")
-            suWriter.flush()
-            
-            scannerProcess = suProcess
-            scannerWriter = suWriter
-            scannerReader = BufferedReader(InputStreamReader(suProcess.inputStream))
-            
-            Log.i(TAG, "✅ Root Scanner initialized at $scannerPath")
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize Root Scanner: ${e.message}", e)
-            false
+        ioLock.withLock {
+            if (scannerProcess != null && pingLocked() != null) return@withLock true
+            stopLocked()
+            startLocked(context)
         }
     }
-    
-    /**
-     * 提取 scanner_root 可执行文件
-     */
-    private fun extractScanner(context: Context): String? {
+
+    private fun startLocked(context: Context): Boolean {
         try {
-            val abi = android.os.Build.SUPPORTED_ABIS[0]
-            val libPath = context.applicationInfo.nativeLibraryDir
-            val scannerDest = File("/data/local/tmp", SCANNER_NAME)
-            // 先写到应用私有目录，再用 su 复制到 /data/local/tmp
-            val tempFile = File(context.cacheDir, SCANNER_NAME)
-
-            // 1. 从 native lib 目录查找（直接名）
-            var scannerSrc = File(libPath, SCANNER_NAME)
-            Log.d(TAG, "Looking for scanner in nativeLibraryDir: $libPath")
-
-            // 2. 如果不存在，查找 libscanner_root.so（jniLibs 会被 Android 重命名）
-            if (!scannerSrc.exists()) {
-                scannerSrc = File(libPath, "lib${SCANNER_NAME}.so")
+            val path = scannerPath ?: extractScanner(context)
+            if (path == null) {
+                lastError = "无法释放 scanner_root 可执行文件"
+                Log.e(TAG, lastError!!)
+                return false
             }
+            scannerPath = path
 
-            // 如果源文件存在，通过 su 复制到 /data/local/tmp
-            if (scannerSrc.exists()) {
-                val result = RootManager.executeRootCommand("cp ${scannerSrc.absolutePath} ${scannerDest.absolutePath} && chmod 755 ${scannerDest.absolutePath}")
-                Log.i(TAG, "Extracted scanner from nativeLibraryDir: ${scannerSrc.name}")
-                return scannerDest.absolutePath
-            }
-
-            // 3. 从 assets 复制到临时目录，再用 su 复制到 /data/local/tmp
-            val assetPath = "native/$abi/$SCANNER_NAME"
-            try {
-                context.assets.open(assetPath).use { input ->
-                    FileOutputStream(tempFile).use { output ->
-                        input.copyTo(output)
-                    }
-                }
-                Log.i(TAG, "Read scanner from assets to temp: ${tempFile.absolutePath} (${tempFile.length()} bytes)")
-
-                // 用 su 复制到 /data/local/tmp 并设置权限
-                val result = RootManager.executeRootCommand("cp ${tempFile.absolutePath} ${scannerDest.absolutePath} && chmod 755 ${scannerDest.absolutePath}")
-                tempFile.delete()
-
-                if (scannerDest.exists() || result != null) {
-                    Log.i(TAG, "Extracted scanner to ${scannerDest.absolutePath}")
-                    return scannerDest.absolutePath
-                } else {
-                    Log.w(TAG, "su copy may have failed, trying direct su exec")
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Assets extraction failed: $assetPath - ${e.javaClass.simpleName}: ${e.message}")
-            }
-
-            // 4. 尝试从 APK 中直接读取（绕过 AssetManager）
-            try {
-                val apkPath = context.applicationInfo.sourceDir
-                val apkAssetPath = "assets/$assetPath" // APK 中的实际路径带 assets/ 前缀
-                java.util.zip.ZipFile(apkPath).use { zip ->
-                    val entry = zip.getEntry(apkAssetPath)
-                    if (entry != null) {
-                        zip.getInputStream(entry).use { input ->
-                            FileOutputStream(tempFile).use { output ->
-                                input.copyTo(output)
-                            }
-                        }
-                        Log.i(TAG, "Read scanner from APK zip to temp (${tempFile.length()} bytes)")
-
-                        val result = RootManager.executeRootCommand("cp ${tempFile.absolutePath} ${scannerDest.absolutePath} && chmod 755 ${scannerDest.absolutePath}")
-                        tempFile.delete()
-                        return scannerDest.absolutePath
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "APK zip extraction failed: ${e.javaClass.simpleName}: ${e.message}")
-            }
-
-            Log.e(TAG, "Scanner not found in any location")
-            return null
-        } catch (e: Exception) {
-            Log.e(TAG, "extractScanner failed: ${e.message}", e)
-            return null
-        }
-    }
-    
-    /**
-     * 发送命令并接收响应
-     */
-    private suspend fun sendCommand(json: String): JSONObject? = withContext(Dispatchers.IO) {
-        try {
-            val writer = scannerWriter ?: return@withContext null
-            val reader = scannerReader ?: return@withContext null
-            
-            writer.write(json)
-            writer.write("\n")
+            val su = Runtime.getRuntime().exec("su")
+            val writer = BufferedWriter(OutputStreamWriter(su.outputStream))
+            writer.write("chmod 755 $path\n")
+            writer.write("exec $path\n")   // exec 替换 shell，避免多留一层进程
             writer.flush()
-            
-            val response = reader.readLine() ?: return@withContext null
-            JSONObject(response)
+
+            val queue = LinkedBlockingQueue<String>()
+            val reader = BufferedReader(InputStreamReader(su.inputStream))
+            val pump = Thread {
+                try {
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        if (line.isNotBlank()) queue.put(line)
+                    }
+                } catch (_: Exception) {
+                    // 进程结束或流关闭，正常退出
+                }
+            }
+            pump.isDaemon = true
+            pump.start()
+
+            scannerProcess = su
+            scannerWriter = writer
+            responses = queue
+            pumpThread = pump
+
+            // 握手：确认拿到的是 v2 协议的扫描器，而不是 su 的横幅或旧版二进制
+            val pong = pingLocked()
+            if (pong == null) {
+                lastError = "scanner_root 启动后无响应（root 未授权或二进制不可执行）"
+                Log.e(TAG, lastError!!)
+                stopLocked()
+                return false
+            }
+            val proto = pong.optInt("proto", 0)
+            if (proto != 2) {
+                lastError = "scanner_root 协议版本不匹配：期望 2，实际 $proto。APK 内可能是旧的预编译二进制"
+                Log.e(TAG, lastError!!)
+                stopLocked()
+                return false
+            }
+
+            Log.i(TAG, "✅ Root Scanner 就绪 @ $path (${pong.optString("version")})")
+            return true
         } catch (e: Exception) {
-            Log.e(TAG, "sendCommand failed: ${e.message}", e)
+            lastError = "启动 scanner_root 失败: ${e.message}"
+            Log.e(TAG, lastError!!, e)
+            stopLocked()
+            return false
+        }
+    }
+
+    /** 握手用：吞掉 su 可能打印的非 JSON 前导行 */
+    private fun pingLocked(): JSONObject? {
+        val w = scannerWriter ?: return null
+        val q = responses ?: return null
+        return try {
+            w.write("{\"cmd\":\"ping\"}\n")
+            w.flush()
+            val deadline = System.currentTimeMillis() + QUICK_TIMEOUT_MS
+            while (System.currentTimeMillis() < deadline) {
+                val line = q.poll(QUICK_TIMEOUT_MS, TimeUnit.MILLISECONDS) ?: return null
+                val obj = try { JSONObject(line) } catch (_: Exception) { continue }
+                if (obj.has("proto")) return obj
+            }
+            null
+        } catch (e: Exception) {
             null
         }
     }
-    
+
+    private fun stopLocked() {
+        try { scannerWriter?.close() } catch (_: Exception) {}
+        try { scannerProcess?.destroy() } catch (_: Exception) {}
+        pumpThread?.interrupt()
+        scannerProcess = null
+        scannerWriter = null
+        responses = null
+        pumpThread = null
+    }
+
+    fun shutdown() = ioLock.withLock { stopLocked() }
+
+    // ==================== 通道 ====================
+
     /**
-     * 精确搜索
+     * 发一条命令收一行响应。全程持锁，超时即重启扫描器。
+     * 返回 null 表示通道故障（原因见 getLastError）。
      */
+    private fun sendLocked(json: String, timeoutMs: Long): JSONObject? {
+        val w = scannerWriter ?: run {
+            lastError = "scanner 未启动"
+            return null
+        }
+        val q = responses ?: run {
+            lastError = "scanner 未启动"
+            return null
+        }
+
+        try {
+            w.write(json)
+            w.write("\n")
+            w.flush()
+        } catch (e: IOException) {
+            lastError = "scanner 通道写入失败: ${e.message}"
+            Log.e(TAG, lastError!!)
+            stopLocked()
+            return null
+        }
+
+        val line = q.poll(timeoutMs, TimeUnit.MILLISECONDS)
+        if (line == null) {
+            // 超时后即便迟到的响应也已与请求错位，只能重启，不能继续用
+            lastError = "scanner ${timeoutMs}ms 未响应，已重启通道"
+            Log.e(TAG, lastError!!)
+            stopLocked()
+            return null
+        }
+
+        return try {
+            JSONObject(line)
+        } catch (e: Exception) {
+            lastError = "scanner 返回非 JSON: ${line.take(200)}"
+            Log.e(TAG, lastError!!)
+            null
+        }
+    }
+
+    private suspend fun send(json: String, timeoutMs: Long = DEFAULT_TIMEOUT_MS): JSONObject? =
+        withContext(Dispatchers.IO) { ioLock.withLock { sendLocked(json, timeoutMs) } }
+
+    /** 检查响应状态；非 ok 时把 msg 记进 lastError 并返回 null */
+    private fun ok(obj: JSONObject?): JSONObject? {
+        if (obj == null) return null
+        if (obj.optString("status") != "ok") {
+            lastError = obj.optString("msg", "scanner 返回未知错误")
+            return null
+        }
+        return obj
+    }
+
+    private fun regionsJson(regions: List<MemoryEngine.MemRegion>): String =
+        regions.joinToString(",") {
+            "{\"start\":${it.startAddr},\"size\":${it.endAddr - it.startAddr}}"
+        }
+
+    private fun toSearchResult(obj: JSONObject): SearchResult = SearchResult(
+        setId = obj.optInt("set", -1),
+        count = obj.optInt("count", 0),
+        truncated = obj.optBoolean("truncated", false),
+        elapsedMs = obj.optLong("elapsed_ms", 0)
+    )
+
+    // ==================== 搜索 ====================
+
     suspend fun searchExact(
         pid: Int,
         regions: List<MemoryEngine.MemRegion>,
-        typeSize: Int,
-        targetBytes: ByteArray
-    ): List<Long> = withContext(Dispatchers.IO) {
-        try {
-            val targetHex = targetBytes.joinToString("") { "%02x".format(it) }
-            val regionsJson = regions.joinToString(",") { 
-                "{\"start\":${it.startAddr},\"size\":${it.endAddr - it.startAddr}}" 
-            }
-            
-            val json = """{"cmd":"search_exact","pid":$pid,"regions":[$regionsJson],"type_size":$typeSize,"target":"$targetHex"}"""
-            
-            val response = sendCommand(json) ?: return@withContext emptyList()
-            
-            if (response.getString("status") != "ok") {
-                return@withContext emptyList()
-            }
-            
-            val addrsStr = response.getString("addrs")
-            if (addrsStr.isEmpty()) return@withContext emptyList()
-            
-            addrsStr.split(",").mapNotNull { it.toLongOrNull(16) }
-        } catch (e: Exception) {
-            Log.e(TAG, "searchExact failed: ${e.message}", e)
-            emptyList()
-        }
+        type: String,
+        targetHex: String,
+        limit: Int = 0,
+        align: Int = 0
+    ): SearchResult? {
+        val sb = StringBuilder()
+        sb.append("{\"cmd\":\"search_exact\",\"pid\":").append(pid)
+        sb.append(",\"type\":\"").append(type).append('"')
+        sb.append(",\"target\":\"").append(targetHex).append('"')
+        if (limit > 0) sb.append(",\"limit\":").append(limit)
+        if (align > 0) sb.append(",\"align\":").append(align)
+        sb.append(",\"regions\":[").append(regionsJson(regions)).append("]}")
+        return ok(send(sb.toString()))?.let { toSearchResult(it) }
     }
-    
-    /**
-     * 范围搜索
-     */
+
     suspend fun searchRange(
         pid: Int,
         regions: List<MemoryEngine.MemRegion>,
-        typeSize: Int,
-        lowBound: Long,
-        highBound: Long
-    ): List<Long> = withContext(Dispatchers.IO) {
-        try {
-            val regionsJson = regions.joinToString(",") { 
-                "{\"start\":${it.startAddr},\"size\":${it.endAddr - it.startAddr}}" 
-            }
-            
-            val json = """{"cmd":"search_range","pid":$pid,"regions":[$regionsJson],"type_size":$typeSize,"low":$lowBound,"high":$highBound}"""
-            
-            val response = sendCommand(json) ?: return@withContext emptyList()
-            
-            if (response.optString("status", "") != "ok") {
-                return@withContext emptyList()
-            }
-
-            val addrsStr = response.optString("addrs", "")
-            if (addrsStr.isEmpty()) return@withContext emptyList()
-
-            addrsStr.split(",").mapNotNull { it.toLongOrNull(16) }
-        } catch (e: Exception) {
-            Log.e(TAG, "searchRange failed: ${e.message}", e)
-            emptyList()
-        }
+        type: String,
+        low: Double,
+        high: Double,
+        limit: Int = 0,
+        align: Int = 0
+    ): SearchResult? {
+        val sb = StringBuilder()
+        sb.append("{\"cmd\":\"search_range\",\"pid\":").append(pid)
+        sb.append(",\"type\":\"").append(type).append('"')
+        sb.append(",\"low\":").append(low)
+        sb.append(",\"high\":").append(high)
+        if (limit > 0) sb.append(",\"limit\":").append(limit)
+        if (align > 0) sb.append(",\"align\":").append(align)
+        sb.append(",\"regions\":[").append(regionsJson(regions)).append("]}")
+        return ok(send(sb.toString()))?.let { toSearchResult(it) }
     }
-    
-    /**
-     * AOB 特征码搜索
-     */
+
     suspend fun searchAob(
         pid: Int,
         regions: List<MemoryEngine.MemRegion>,
-        pattern: ByteArray,
-        mask: ByteArray
-    ): List<Long> = withContext(Dispatchers.IO) {
-        try {
-            val patternHex = pattern.joinToString("") { "%02x".format(it) }
-            val maskHex = mask.joinToString("") { "%02x".format(it) }
-            val regionsJson = regions.joinToString(",") { 
-                "{\"start\":${it.startAddr},\"size\":${it.endAddr - it.startAddr}}" 
-            }
-            
-            val json = """{"cmd":"search_aob","pid":$pid,"regions":[$regionsJson],"pattern":"$patternHex","mask":"$maskHex"}"""
-            
-            val response = sendCommand(json) ?: return@withContext emptyList()
-            
-            if (response.getString("status") != "ok") {
-                return@withContext emptyList()
-            }
-            
-            val addrsStr = response.getString("addrs")
-            if (addrsStr.isEmpty()) return@withContext emptyList()
-            
-            addrsStr.split(",").mapNotNull { it.toLongOrNull(16) }
-        } catch (e: Exception) {
-            Log.e(TAG, "searchAob failed: ${e.message}", e)
-            emptyList()
-        }
+        patternHex: String,
+        maskHex: String,
+        limit: Int = 0
+    ): SearchResult? {
+        val sb = StringBuilder()
+        sb.append("{\"cmd\":\"search_aob\",\"pid\":").append(pid)
+        sb.append(",\"pattern\":\"").append(patternHex).append('"')
+        sb.append(",\"mask\":\"").append(maskHex).append('"')
+        if (limit > 0) sb.append(",\"limit\":").append(limit)
+        sb.append(",\"regions\":[").append(regionsJson(regions)).append("]}")
+        return ok(send(sb.toString()))?.let { toSearchResult(it) }
     }
-    
-    /**
-     * 模糊搜索
-     */
-    suspend fun searchFuzzy(
+
+    // ==================== 二次过滤 ====================
+
+    suspend fun refineValue(pid: Int, setId: Int, type: String, targetHex: String): SearchResult? {
+        val json = "{\"cmd\":\"refine_value\",\"pid\":$pid,\"set\":$setId," +
+                "\"type\":\"$type\",\"target\":\"$targetHex\"}"
+        return ok(send(json))?.let { toSearchResult(it) }
+    }
+
+    suspend fun refineRange(pid: Int, setId: Int, type: String, low: Double, high: Double): SearchResult? {
+        val json = "{\"cmd\":\"refine_range\",\"pid\":$pid,\"set\":$setId," +
+                "\"type\":\"$type\",\"low\":$low,\"high\":$high}"
+        return ok(send(json))?.let { toSearchResult(it) }
+    }
+
+    /** mode: 0=changed 1=unchanged 2=increased 3=decreased */
+    suspend fun refineFuzzy(pid: Int, setId: Int, mode: Int): SearchResult? {
+        val json = "{\"cmd\":\"refine_fuzzy\",\"pid\":$pid,\"set\":$setId,\"mode\":$mode}"
+        return ok(send(json))?.let { toSearchResult(it) }
+    }
+
+    suspend fun snapshot(pid: Int, setId: Int): Int? {
+        val json = "{\"cmd\":\"snapshot\",\"pid\":$pid,\"set\":$setId}"
+        return ok(send(json))?.optInt("count", 0)
+    }
+
+    // ==================== 结果读取 ====================
+
+    suspend fun getResults(
         pid: Int,
-        addresses: List<Long>,
-        oldValues: ByteArray,
-        mode: Int,
-        typeSize: Int
-    ): List<Long> = withContext(Dispatchers.IO) {
-        try {
-            val addrsStr = addresses.joinToString(",") { it.toString(16) }
-            val valsHex = oldValues.joinToString("") { "%02x".format(it) }
-            
-            val json = """{"cmd":"search_fuzzy","pid":$pid,"addrs":[$addrsStr],"old_vals":"$valsHex","mode":$mode,"type_size":$typeSize}"""
-            
-            val response = sendCommand(json) ?: return@withContext emptyList()
-            
-            if (response.optString("status", "") != "ok") {
-                return@withContext emptyList()
+        setId: Int,
+        offset: Int,
+        limit: Int,
+        withMachineCode: Boolean = false
+    ): ResultPage? {
+        val json = "{\"cmd\":\"get_results\",\"pid\":$pid,\"set\":$setId," +
+                "\"offset\":$offset,\"limit\":$limit,\"mc\":${if (withMachineCode) 1 else 0}}"
+        val obj = ok(send(json)) ?: return null
+
+        val arr = obj.optJSONArray("items")
+        val items = ArrayList<ResultItem>(arr?.length() ?: 0)
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val it = arr.optJSONObject(i) ?: continue
+                val addr = it.optString("a").toLongOrNull(16) ?: continue
+                val vHex = it.optString("v", "")
+                items.add(
+                    ResultItem(
+                        address = addr,
+                        valueBytes = if (vHex.isEmpty()) null else hexToBytes(vHex),
+                        machineCode = it.optString("m", "").ifEmpty { null }
+                    )
+                )
             }
+        }
+        return ResultPage(
+            setId = obj.optInt("set", setId),
+            total = obj.optInt("count", 0),
+            offset = obj.optInt("offset", offset),
+            type = obj.optString("type", "dword"),
+            items = items
+        )
+    }
 
-            val resultAddrsStr = response.optString("addrs", "")
-            if (resultAddrsStr.isEmpty()) return@withContext emptyList()
+    suspend fun listSets(): List<SetInfo> {
+        val obj = ok(send("{\"cmd\":\"list_sets\"}", QUICK_TIMEOUT_MS)) ?: return emptyList()
+        val arr = obj.optJSONArray("sets") ?: return emptyList()
+        val out = ArrayList<SetInfo>(arr.length())
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            out.add(SetInfo(o.optInt("id"), o.optInt("count"), o.optString("type", "dword")))
+        }
+        return out
+    }
 
-            resultAddrsStr.split(",").mapNotNull { it.toLongOrNull(16) }
-        } catch (e: Exception) {
-            Log.e(TAG, "searchFuzzy failed: ${e.message}", e)
-            emptyList()
+    /** setId 传 -1 清空全部 */
+    suspend fun clearSet(setId: Int): Boolean =
+        ok(send("{\"cmd\":\"clear_set\",\"set\":$setId}", QUICK_TIMEOUT_MS)) != null
+
+    // ==================== 读写 ====================
+
+    suspend fun readMemory(pid: Int, address: Long, size: Int): ByteArray? {
+        val json = "{\"cmd\":\"read\",\"pid\":$pid,\"addr\":$address,\"size\":$size}"
+        val obj = ok(send(json, QUICK_TIMEOUT_MS)) ?: return null
+        val hex = obj.optString("data", "")
+        return if (hex.isEmpty()) null else hexToBytes(hex)
+    }
+
+    /** 一次读多个等长地址，替代旧版逐地址往返 */
+    suspend fun readMany(pid: Int, addresses: List<Long>, size: Int): List<ByteArray?> {
+        if (addresses.isEmpty()) return emptyList()
+        val sb = StringBuilder()
+        sb.append("{\"cmd\":\"read_many\",\"pid\":").append(pid)
+        sb.append(",\"size\":").append(size).append(",\"addrs\":[")
+        addresses.forEachIndexed { i, a ->
+            if (i > 0) sb.append(',')
+            sb.append('"').append(java.lang.Long.toHexString(a)).append('"')
+        }
+        sb.append("]}")
+
+        val obj = ok(send(sb.toString())) ?: return List(addresses.size) { null }
+        val arr = obj.optJSONArray("data") ?: return List(addresses.size) { null }
+        return (0 until arr.length()).map { i ->
+            val hex = arr.optString(i, "")
+            if (hex.isEmpty()) null else hexToBytes(hex)
         }
     }
-    
-    /**
-     * 读取内存
-     */
-    suspend fun readMemory(pid: Int, address: Long, size: Int): ByteArray? = withContext(Dispatchers.IO) {
-        try {
-            val json = """{"cmd":"read","pid":$pid,"addr":$address,"size":$size}"""
-            
-            val response = sendCommand(json) ?: return@withContext null
-            
-            if (response.optString("status", "") != "ok") {
-                return@withContext null
-            }
 
-            val dataHex = response.optString("data", "")
-            if (dataHex.isEmpty()) return@withContext null
-            val bytes = ByteArray(dataHex.length / 2)
-            for (i in bytes.indices) {
-                val hex = dataHex.substring(i * 2, i * 2 + 2)
-                bytes[i] = hex.toInt(16).toByte()
+    suspend fun writeMemory(pid: Int, address: Long, data: ByteArray): Boolean {
+        val json = "{\"cmd\":\"write\",\"pid\":$pid,\"addr\":$address," +
+                "\"data\":\"${bytesToHex(data)}\"}"
+        return ok(send(json, QUICK_TIMEOUT_MS)) != null
+    }
+
+    // ==================== 工具 ====================
+
+    private fun hexToBytes(hex: String): ByteArray? {
+        if (hex.length % 2 != 0) return null
+        return try {
+            ByteArray(hex.length / 2) {
+                ((Character.digit(hex[it * 2], 16) shl 4) or
+                        Character.digit(hex[it * 2 + 1], 16)).toByte()
             }
-            bytes
         } catch (e: Exception) {
-            Log.e(TAG, "readMemory failed: ${e.message}", e)
             null
         }
     }
-    
-    /**
-     * 写入内存
-     */
-    suspend fun writeMemory(pid: Int, address: Long, data: ByteArray): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val dataHex = data.joinToString("") { "%02x".format(it) }
-            val json = """{"cmd":"write","pid":$pid,"addr":$address,"data":"$dataHex"}"""
-            
-            val response = sendCommand(json) ?: return@withContext false
-            
-            response.getString("status") == "ok"
-        } catch (e: Exception) {
-            Log.e(TAG, "writeMemory failed: ${e.message}", e)
-            false
-        }
+
+    private fun bytesToHex(bytes: ByteArray): String {
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) sb.append("%02x".format(b))
+        return sb.toString()
     }
-    
-    /**
-     * 关闭 Scanner
-     */
-    fun shutdown() {
+
+    // ==================== 可执行文件释放 ====================
+
+    private fun extractScanner(context: Context): String? {
+        val dest = File("/data/local/tmp", SCANNER_NAME)
+        val temp = File(context.cacheDir, SCANNER_NAME)
         try {
-            scannerWriter?.close()
-            scannerReader?.close()
-            scannerProcess?.destroy()
+            val libDir = context.applicationInfo.nativeLibraryDir
+
+            // 1. nativeLibraryDir（jniLibs 打包会被重命名成 lib*.so）
+            var src = File(libDir, SCANNER_NAME)
+            if (!src.exists()) src = File(libDir, "lib$SCANNER_NAME.so")
+            if (src.exists()) {
+                RootManager.executeRootCommand(
+                    "cp ${src.absolutePath} ${dest.absolutePath} && chmod 755 ${dest.absolutePath}"
+                )
+                Log.i(TAG, "scanner 来自 nativeLibraryDir: ${src.name}")
+                return dest.absolutePath
+            }
+
+            // 2. assets
+            val abi = android.os.Build.SUPPORTED_ABIS[0]
+            val assetPath = "native/$abi/$SCANNER_NAME"
+            try {
+                context.assets.open(assetPath).use { input ->
+                    FileOutputStream(temp).use { output -> input.copyTo(output) }
+                }
+                RootManager.executeRootCommand(
+                    "cp ${temp.absolutePath} ${dest.absolutePath} && chmod 755 ${dest.absolutePath}"
+                )
+                temp.delete()
+                Log.i(TAG, "scanner 来自 assets/$assetPath")
+                return dest.absolutePath
+            } catch (e: Exception) {
+                Log.w(TAG, "assets 释放失败 $assetPath: ${e.message}")
+            }
+
+            // 3. 直接从 APK zip 读（绕过 AssetManager 压缩策略）
+            try {
+                java.util.zip.ZipFile(context.applicationInfo.sourceDir).use { zip ->
+                    val entry = zip.getEntry("assets/$assetPath")
+                    if (entry != null) {
+                        zip.getInputStream(entry).use { input ->
+                            FileOutputStream(temp).use { output -> input.copyTo(output) }
+                        }
+                        RootManager.executeRootCommand(
+                            "cp ${temp.absolutePath} ${dest.absolutePath} && chmod 755 ${dest.absolutePath}"
+                        )
+                        temp.delete()
+                        Log.i(TAG, "scanner 来自 APK zip")
+                        return dest.absolutePath
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "APK zip 释放失败: ${e.message}")
+            }
+
+            Log.e(TAG, "所有位置都找不到 $SCANNER_NAME")
+            return null
         } catch (e: Exception) {
-            Log.e(TAG, "shutdown failed: ${e.message}")
+            Log.e(TAG, "extractScanner 失败: ${e.message}", e)
+            return null
         }
-        scannerProcess = null
-        scannerWriter = null
-        scannerReader = null
     }
 }

@@ -3,13 +3,22 @@ package com.yl.aigg.ai_gg666
 import java.io.BufferedReader
 import java.io.DataOutputStream
 import java.io.InputStreamReader
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * Root 权限管理器
  * 使用持久化 su shell，只建立一次连接，避免重复弹窗
+ *
+ * 注意：executeCommandInternal 是「写命令 + 读到标记为止」的有状态往返，
+ * 必须串行。旧版没有任何同步，单线程 UI 下侥幸没暴露；MCP 服务器会并发调用
+ * （进程列表、内存段解析等），不加锁会让两个命令的输出互相串进对方的结果里。
  */
 object RootManager {
 
+    private val shellLock = ReentrantLock()
+
+    @Volatile
     private var hasRootAccess: Boolean? = null
     private var suProcess: Process? = null
     private var suOutputStream: DataOutputStream? = null
@@ -21,13 +30,13 @@ object RootManager {
      */
     fun checkRootAccess(): Boolean {
         if (hasRootAccess == true) return true
-        return initSuShell()
+        return shellLock.withLock { initSuShellLocked() }
     }
 
     /**
      * 初始化 su shell（只执行一次）
      */
-    private fun initSuShell(): Boolean {
+    private fun initSuShellLocked(): Boolean {
         if (hasRootAccess == true) return true
 
         try {
@@ -36,17 +45,17 @@ object RootManager {
             suReader = BufferedReader(InputStreamReader(suProcess!!.inputStream))
 
             // 测试 root 权限
-            val result = executeCommandInternal("id")
+            val result = executeCommandInternalLocked("id")
             hasRootAccess = result?.contains("uid=0") == true
 
             if (!hasRootAccess!!) {
-                closeSuShell()
+                closeSuShellLocked()
             }
 
             return hasRootAccess!!
         } catch (e: Exception) {
             hasRootAccess = false
-            closeSuShell()
+            closeSuShellLocked()
             return false
         }
     }
@@ -59,26 +68,26 @@ object RootManager {
     }
 
     /**
-     * 执行 root 命令（使用持久化 shell）
+     * 执行 root 命令（使用持久化 shell，串行）
      */
-    fun executeRootCommand(command: String): String? {
+    fun executeRootCommand(command: String): String? = shellLock.withLock {
         if (hasRootAccess != true) {
-            if (!initSuShell()) return null
+            if (!initSuShellLocked()) return@withLock null
         }
-        return executeCommandInternal(command)
+        executeCommandInternalLocked(command)
     }
 
     /**
-     * 内部命令执行
+     * 内部命令执行。调用方必须已持有 shellLock。
      */
-    private fun executeCommandInternal(command: String): String? {
+    private fun executeCommandInternalLocked(command: String): String? {
         try {
             val os = suOutputStream ?: return null
             val reader = suReader ?: return null
 
             // 使用唯一标记分隔输出
             val marker = "CMD_DONE_${System.nanoTime()}"
-            
+
             os.writeBytes("$command\n")
             os.writeBytes("echo $marker\n")
             os.flush()
@@ -93,15 +102,15 @@ object RootManager {
             return output.toString().trim()
         } catch (e: Exception) {
             // 连接断开，重新初始化
-            closeSuShell()
+            closeSuShellLocked()
             return null
         }
     }
 
     /**
-     * 关闭 su shell
+     * 关闭 su shell。调用方必须已持有 shellLock。
      */
-    private fun closeSuShell() {
+    private fun closeSuShellLocked() {
         try {
             suOutputStream?.writeBytes("exit\n")
             suOutputStream?.flush()
@@ -128,8 +137,8 @@ object RootManager {
     /**
      * 重置 Root 状态
      */
-    fun resetRootStatus() {
-        closeSuShell()
+    fun resetRootStatus() = shellLock.withLock {
+        closeSuShellLocked()
         hasRootAccess = null
     }
 

@@ -1105,7 +1105,7 @@ class OverlayService : Service() {
                 showWriteDialog(addr, v, mc)
             })
             row.addView(miniBtn("冻") {
-                val ai = addr.removePrefix("0x").removePrefix("0X").toLongOrNull(16)?.toInt() ?: return@miniBtn
+                val ai = addr.removePrefix("0x").removePrefix("0X").toLongOrNull(16) ?: return@miniBtn
                 Thread { if (v != null) MemoryFreezer.freeze(ai, v, searchDataType) }.start()
             })
 

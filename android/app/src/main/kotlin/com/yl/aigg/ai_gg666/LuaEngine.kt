@@ -15,20 +15,41 @@ import org.luaj.vm2.lib.TwoArgFunction
 import org.luaj.vm2.lib.VarArgFunction
 import org.luaj.vm2.lib.jse.JsePlatform
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * LuaJ GG API 桥接层
  * 在 JVM 中执行 Lua 脚本，提供与 GG 修改器兼容的交互式 API
+ *
+ * 两处为 MCP 补的能力：
+ * - headless 模式：MCP 调用时没有人在看屏幕，gg.choice/prompt/alert 若照常
+ *   弹窗并 CountDownLatch.await()，请求线程会永久卡住。headless 下这些调用
+ *   立即返回默认值，并在输出日志里注明被跳过，让 agent 知道脚本走了哪条分支。
+ * - 执行串行化：searchResults / outputLog 是对象级可变状态，且每次执行都会
+ *   clear()，并发调用会互相清空对方的结果。
  */
 object LuaEngine {
+
+    /** 有界面时的交互等待上限，避免脚本无限期挂着 */
+    private const val DIALOG_TIMEOUT_SEC = 180L
+
+    /** headless 下 gg.sleep 的单次上限，防止脚本长时间占住通道 */
+    private const val HEADLESS_MAX_SLEEP_MS = 10_000L
+
+    private val execLock = ReentrantLock()
 
     private var context: Context? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var searchResults = mutableListOf<Map<String, Any>>()
     private var frozenList = mutableListOf<Map<String, Any>>()
     private val outputLog = StringBuilder()
+
+    @Volatile
+    private var headless = false
 
     fun setContext(ctx: Context?) {
         context = ctx
@@ -38,25 +59,33 @@ object LuaEngine {
         context = act
     }
 
-    fun executeScript(scriptContent: String): String {
-        outputLog.clear()
-        searchResults.clear()
-        frozenList.clear()
+    /**
+     * @param headlessMode true 表示无人值守（MCP 调用）：交互式 API 不弹窗，
+     *                     直接返回默认值并记录在输出里。
+     */
+    fun executeScript(scriptContent: String, headlessMode: Boolean = false): String =
+        execLock.withLock {
+            headless = headlessMode
+            outputLog.clear()
+            searchResults.clear()
+            frozenList.clear()
 
-        try {
-            val globals = JsePlatform.standardGlobals()
-            val gg = LuaTable()
-            registerGgApi(gg)
-            globals.set("gg", gg)
-            val chunk = globals.load(scriptContent)
-            chunk.call()
-            return outputLog.toString()
-        } catch (e: Exception) {
-            val errorMsg = "Lua 执行错误: ${e.message}"
-            outputLog.appendLine(errorMsg)
-            return outputLog.toString()
+            try {
+                val globals = JsePlatform.standardGlobals()
+                val gg = LuaTable()
+                registerGgApi(gg)
+                globals.set("gg", gg)
+                val chunk = globals.load(scriptContent)
+                chunk.call()
+                outputLog.toString()
+            } catch (e: Exception) {
+                val errorMsg = "Lua 执行错误: ${e.message}"
+                outputLog.appendLine(errorMsg)
+                outputLog.toString()
+            } finally {
+                headless = false
+            }
         }
-    }
 
     private fun getOverlayType(): Int {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -76,6 +105,10 @@ object LuaEngine {
     }
 
     private fun showChoiceDialog(title: String, items: List<String>): Int {
+        if (headless) {
+            outputLog.appendLine("  → [无人值守] 未弹窗，按取消处理")
+            return -1
+        }
         val latch = CountDownLatch(1)
         val selectedIndex = AtomicInteger(-1)
         val ctx = context ?: return -1
@@ -102,11 +135,18 @@ object LuaEngine {
             }
         }
 
-        latch.await()
+        if (!latch.await(DIALOG_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+            outputLog.appendLine("⚠️ 等待选择超时，按取消处理")
+            return -1
+        }
         return selectedIndex.get()
     }
 
     private fun showInputDialog(title: String, defaultValue: String): String {
+        if (headless) {
+            outputLog.appendLine("  → [无人值守] 未弹输入框，采用默认值 \"$defaultValue\"")
+            return defaultValue
+        }
         val latch = CountDownLatch(1)
         val inputResult = AtomicReference(defaultValue)
         val ctx = context ?: return defaultValue
@@ -138,11 +178,18 @@ object LuaEngine {
             }
         }
 
-        latch.await()
+        if (!latch.await(DIALOG_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+            outputLog.appendLine("⚠️ 等待输入超时，采用默认值")
+            return defaultValue
+        }
         return inputResult.get()
     }
 
     private fun showConfirmDialog(title: String, message: String): Boolean {
+        if (headless) {
+            outputLog.appendLine("  → [无人值守] 未弹确认框，按确定处理")
+            return true
+        }
         val latch = CountDownLatch(1)
         val confirmed = AtomicInteger(0)
         val ctx = context ?: return false
@@ -169,7 +216,10 @@ object LuaEngine {
             }
         }
 
-        latch.await()
+        if (!latch.await(DIALOG_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+            outputLog.appendLine("⚠️ 等待确认超时，按取消处理")
+            return false
+        }
         return confirmed.get() == 1
     }
 
@@ -338,7 +388,7 @@ object LuaEngine {
                         val value = itemTable.get("value")
                         val flags = itemTable.get("flags")
                         if (!addr.isnil() && !value.isnil()) {
-                            val address = addr.tojstring().toLongOrNull(16)?.toInt() ?: continue
+                            val address = addr.tojstring().toLongOrNull(16) ?: continue
                             val type = luaTypeToDataType(flags.toint())
                             val numValue: Any = when (type) {
                                 "float", "double" -> value.todouble()
@@ -356,7 +406,7 @@ object LuaEngine {
         // gg.writeMemory
         gg.set("writeMemory", object : VarArgFunction() {
             override fun invoke(args: Varargs): Varargs {
-                val address = args.arg(1).tojstring().toLongOrNull(16)?.toInt() ?: return LuaValue.valueOf(false)
+                val address = args.arg(1).tojstring().toLongOrNull(16) ?: return LuaValue.valueOf(false)
                 val value = args.arg(2)
                 val type = luaTypeToDataType(args.arg(3).toint())
                 val numValue: Any = when (type) {
@@ -372,7 +422,7 @@ object LuaEngine {
         // gg.freeze
         gg.set("freeze", object : VarArgFunction() {
             override fun invoke(args: Varargs): Varargs {
-                val address = args.arg(1).tojstring().toLongOrNull(16)?.toInt() ?: return LuaValue.valueOf(false)
+                val address = args.arg(1).tojstring().toLongOrNull(16) ?: return LuaValue.valueOf(false)
                 val value = args.arg(2)
                 val type = luaTypeToDataType(args.arg(3).toint())
                 val numValue: Any = when (type) {
@@ -397,7 +447,7 @@ object LuaEngine {
                         val itemTable = item.checktable()
                         val freeze = itemTable.get("freeze")
                         if (freeze.toboolean()) {
-                            val address = itemTable.get("address").tojstring().toLongOrNull(16)?.toInt() ?: continue
+                            val address = itemTable.get("address").tojstring().toLongOrNull(16) ?: continue
                             val value = itemTable.get("value")
                             val flags = itemTable.get("flags")
                             val type = luaTypeToDataType(flags.toint())
@@ -427,7 +477,12 @@ object LuaEngine {
         // gg.sleep
         gg.set("sleep", object : OneArgFunction() {
             override fun call(arg: LuaValue): LuaValue {
-                try { Thread.sleep(arg.tolong()) } catch (_: Exception) {}
+                var ms = arg.tolong()
+                if (headless && ms > HEADLESS_MAX_SLEEP_MS) {
+                    outputLog.appendLine("  → [无人值守] sleep($ms) 收敛为 ${HEADLESS_MAX_SLEEP_MS}ms")
+                    ms = HEADLESS_MAX_SLEEP_MS
+                }
+                try { Thread.sleep(ms) } catch (_: Exception) {}
                 return LuaValue.NIL
             }
         })

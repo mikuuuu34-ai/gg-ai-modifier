@@ -215,7 +215,7 @@ class MainActivity : FlutterActivity() {
 
                 // 内存读写（全部在后台线程执行）
                 "readMemory" -> {
-                    val address = call.argument<Int>("address")
+                    val address = (call.argument<Number>("address"))?.toLong()
                     if (address == null) {
                         result.error("INVALID_ADDRESS", "Address is required", null)
                         return@setMethodCallHandler
@@ -231,7 +231,7 @@ class MainActivity : FlutterActivity() {
                     }.start()
                 }
                 "writeMemory" -> {
-                    val address = call.argument<Int>("address")
+                    val address = (call.argument<Number>("address"))?.toLong()
                     val value = call.argument<Any>("value")
                     if (address == null || value == null) {
                         result.error("INVALID_PARAMS", "Address and value are required", null)
@@ -261,7 +261,7 @@ class MainActivity : FlutterActivity() {
 
                 // 内存冻结
                 "freezeMemory" -> {
-                    val address = call.argument<Int>("address")
+                    val address = (call.argument<Number>("address"))?.toLong()
                     val value = call.argument<Any>("value")
                     if (address == null || value == null) {
                         result.error("INVALID_PARAMS", "Address and value are required", null)
@@ -275,7 +275,7 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "unfreezeMemory" -> {
-                    val address = call.argument<Int>("address")
+                    val address = (call.argument<Number>("address"))?.toLong()
                     if (address == null) {
                         result.error("INVALID_ADDRESS", "Address is required", null)
                         return@setMethodCallHandler
@@ -306,7 +306,7 @@ class MainActivity : FlutterActivity() {
                     }.start()
                 }
                 "analyzeMemoryRegion" -> {
-                    val address = call.argument<Int>("address")
+                    val address = (call.argument<Number>("address"))?.toLong()
                     if (address == null) {
                         result.error("INVALID_ADDRESS", "Address is required", null)
                         return@setMethodCallHandler
@@ -671,7 +671,7 @@ class MainActivity : FlutterActivity() {
                     else -> "dword"
                 }
 
-                val address = addrStr.toLongOrNull(16)?.toInt() ?: continue
+                val address = addrStr.toLongOrNull(16) ?: continue
                 val value: Any = when (type) {
                     "float", "double" -> valueStr.toDoubleOrNull() ?: 0.0
                     else -> valueStr.toLongOrNull() ?: 0

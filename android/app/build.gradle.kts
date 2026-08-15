@@ -58,82 +58,92 @@ android {
 
 dependencies {
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))
+
+    // MCP 服务：轻量 HTTP 服务端（Streamable HTTP 传输）
+    implementation("org.nanohttpd:nanohttpd:2.3.1")
+
+    // MemoryEngine / RootScanner 用到协程；原先靠传递依赖引入，显式声明避免版本漂移
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 }
 
 flutter {
     source = "../.."
 }
 
-// 复制 scanner_root 可执行文件到 assets（jniLibs 会被重命名为 lib*.so）
+// scanner_root 走 assets 分发（放 jniLibs 会被重命名成 lib*.so，丢掉可执行属性），
+// 所以必须在「资源合并」之前把 CMake 刚编出来的产物刷进 src/main/assets。
 tasks.register("copyScannerRoot") {
+    // 输入是 CMake 产物目录，输出是 assets，声明出来让 Gradle 正确判断是否需要重跑
+    outputs.upToDateWhen { false }
+
     doLast {
-        val buildDir = layout.buildDirectory.get().asFile
+        val buildDirFile = layout.buildDirectory.get().asFile
         val abiList = listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
 
         var copied = 0
         abiList.forEach { abi ->
-            // 动态搜索 scanner_root（路径格式: intermediates/cxx/debug/$hash/obj/$abi/scanner_root）
             var srcFile: File? = null
 
-            // 搜索 cxx 和 cmake 目录（可能有 debug/release）
-            for (variant in listOf("debug", "release")) {
+            // 路径形如 intermediates/cxx/{Debug,Release}/$hash/obj/$abi/scanner_root
+            // 注意 AGP 8 用的是首字母大写的 Debug/Release
+            for (variant in listOf("Release", "Debug", "release", "debug")) {
                 for (prefix in listOf("cxx", "cmake")) {
-                    val baseDir = File("$buildDir/intermediates/$prefix/$variant")
+                    val baseDir = File("$buildDirFile/intermediates/$prefix/$variant")
                     if (!baseDir.exists()) continue
-
-                    // 遍历哈希子目录
                     baseDir.listFiles()?.forEach { hashDir ->
                         if (!hashDir.isDirectory) return@forEach
                         val candidate = File(hashDir, "obj/$abi/scanner_root")
-                        if (candidate.exists()) {
+                        if (candidate.exists() && (srcFile == null ||
+                                    candidate.lastModified() > srcFile!!.lastModified())) {
                             srcFile = candidate
-                            return@forEach
                         }
                     }
-                    if (srcFile != null) break
                 }
-                if (srcFile != null) break
             }
 
-            if (srcFile != null) {
+            val found = srcFile
+            if (found != null) {
                 val destDir = file("src/main/assets/native/$abi")
                 val destFile = file("$destDir/scanner_root")
                 destDir.mkdirs()
-                srcFile!!.copyTo(destFile, overwrite = true)
-                println("✅ Copied scanner_root for $abi from ${srcFile!!.absolutePath}")
+                found.copyTo(destFile, overwrite = true)
+                println("✅ copyScannerRoot: $abi ← ${found.absolutePath} (${found.length()} bytes)")
                 copied++
             } else {
-                println("⚠️ scanner_root not found for $abi")
+                println("⚠️ copyScannerRoot: 未找到 $abi 的 scanner_root")
             }
         }
 
         if (copied == 0) {
-            println("❌ No scanner_root found for any ABI. CMake build may have failed.")
+            throw GradleException(
+                "copyScannerRoot 没有找到任何 ABI 的 scanner_root 产物。" +
+                "若继续打包，APK 里会是仓库中那份陈旧的预编译二进制，" +
+                "对 C++ 的所有修改都不会生效。"
+            )
         }
     }
 }
 
-// 在 CMake 构建完成后自动复制 scanner_root 到 assets
+// 把 copyScannerRoot 正确嵌进任务图。
+// 原实现只挂在 externalNativeBuildDebug / mergeDebugNativeLibs / buildCMakeDebug 上，
+// release 构建根本不会触发，导致 `flutter build apk --release` 打包的是仓库里
+// 提交的旧二进制 —— C++ 改了也白改。
 afterEvaluate {
-    // 尝试多种可能的 CMake 构建任务名称
-    val cmakeTaskNames = listOf(
-        "externalNativeBuildDebug",
-        "mergeDebugNativeLibs",
-        "buildCMakeDebug",
-    )
+    val nativeTaskNames = tasks.names.filter { it.startsWith("externalNativeBuild") }
 
-    var linked = false
-    for (taskName in cmakeTaskNames) {
-        tasks.findByName(taskName)?.let { task ->
-            task.finalizedBy("copyScannerRoot")
-            linked = true
-            println("✅ Linked copyScannerRoot after: $taskName")
-        }
+    // 复制动作必须排在所有 CMake 产物生成之后
+    tasks.named("copyScannerRoot").configure {
+        mustRunAfter(*nativeTaskNames.toTypedArray())
     }
 
-    // 兜底：也作为 assembleDebug 的依赖
-    if (!linked) {
-        tasks.findByName("assembleDebug")?.dependsOn("copyScannerRoot")
-        println("⚠️ Linked copyScannerRoot as dependency of assembleDebug (fallback)")
+    // 每个变体的资源合并都要先等对应的 CMake 构建 + 复制完成
+    listOf("Debug", "Release", "Profile").forEach { variant ->
+        val mergeTask = tasks.findByName("merge${variant}Assets") ?: return@forEach
+        val nativeTask = tasks.findByName("externalNativeBuild$variant")
+        if (nativeTask != null) {
+            mergeTask.dependsOn(nativeTask)
+        }
+        mergeTask.dependsOn("copyScannerRoot")
+        println("✅ merge${variant}Assets 已串上 copyScannerRoot")
     }
 }
