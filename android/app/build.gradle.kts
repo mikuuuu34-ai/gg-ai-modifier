@@ -73,53 +73,51 @@ flutter {
 // scanner_root 走 assets 分发（放 jniLibs 会被重命名成 lib*.so，丢掉可执行属性），
 // 所以必须在「资源合并」之前把 CMake 刚编出来的产物刷进 src/main/assets。
 tasks.register("copyScannerRoot") {
-    // 输入是 CMake 产物目录，输出是 assets，声明出来让 Gradle 正确判断是否需要重跑
     outputs.upToDateWhen { false }
 
     doLast {
         val buildDirFile = layout.buildDirectory.get().asFile
-        val abiList = listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+        val abiList = setOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
 
-        var copied = 0
-        abiList.forEach { abi ->
-            var srcFile: File? = null
+        // AGP 8 的 release 变体，CMake 构建类型目录叫 RelWithDebInfo 而不是 Release，
+        // 目录层级也随版本变动。与其枚举名字，不如把整棵中间产物树扫一遍取最新的那份。
+        val searchRoots = listOf(
+            File(buildDirFile, "intermediates/cxx"),
+            File(buildDirFile, "intermediates/cmake")
+        ).filter { it.exists() }
 
-            // 路径形如 intermediates/cxx/{Debug,Release}/$hash/obj/$abi/scanner_root
-            // 注意 AGP 8 用的是首字母大写的 Debug/Release
-            for (variant in listOf("Release", "Debug", "release", "debug")) {
-                for (prefix in listOf("cxx", "cmake")) {
-                    val baseDir = File("$buildDirFile/intermediates/$prefix/$variant")
-                    if (!baseDir.exists()) continue
-                    baseDir.listFiles()?.forEach { hashDir ->
-                        if (!hashDir.isDirectory) return@forEach
-                        val candidate = File(hashDir, "obj/$abi/scanner_root")
-                        if (candidate.exists() && (srcFile == null ||
-                                    candidate.lastModified() > srcFile!!.lastModified())) {
-                            srcFile = candidate
-                        }
+        val newest = HashMap<String, File>()
+        searchRoots.forEach { root ->
+            root.walkTopDown().forEach { f ->
+                if (f.isFile && f.name == "scanner_root") {
+                    val abi = f.parentFile?.name
+                    if (abi != null && abi in abiList) {
+                        val prev = newest[abi]
+                        if (prev == null || f.lastModified() > prev.lastModified()) newest[abi] = f
                     }
                 }
             }
-
-            val found = srcFile
-            if (found != null) {
-                val destDir = file("src/main/assets/native/$abi")
-                val destFile = file("$destDir/scanner_root")
-                destDir.mkdirs()
-                found.copyTo(destFile, overwrite = true)
-                println("✅ copyScannerRoot: $abi ← ${found.absolutePath} (${found.length()} bytes)")
-                copied++
-            } else {
-                println("⚠️ copyScannerRoot: 未找到 $abi 的 scanner_root")
-            }
         }
 
-        if (copied == 0) {
+        if (newest.isEmpty()) {
+            println("搜索过的目录: ${searchRoots.joinToString { it.absolutePath }}")
             throw GradleException(
                 "copyScannerRoot 没有找到任何 ABI 的 scanner_root 产物。" +
                 "若继续打包，APK 里会是仓库中那份陈旧的预编译二进制，" +
                 "对 C++ 的所有修改都不会生效。"
             )
+        }
+
+        abiList.forEach { abi ->
+            val src = newest[abi]
+            if (src == null) {
+                println("⚠️ copyScannerRoot: 未找到 $abi 的产物，该 ABI 仍是仓库里的旧二进制")
+                return@forEach
+            }
+            val destDir = file("src/main/assets/native/$abi")
+            destDir.mkdirs()
+            src.copyTo(File(destDir, "scanner_root"), overwrite = true)
+            println("✅ copyScannerRoot: $abi ← ${src.absolutePath} (${src.length()} bytes)")
         }
     }
 }
@@ -129,20 +127,21 @@ tasks.register("copyScannerRoot") {
 // release 构建根本不会触发，导致 `flutter build apk --release` 打包的是仓库里
 // 提交的旧二进制 —— C++ 改了也白改。
 afterEvaluate {
-    val nativeTaskNames = tasks.names.filter { it.startsWith("externalNativeBuild") }
+    // AGP 8 用的是按 ABI 拆分的 buildCMakeDebug[arm64-v8a] / buildCMakeRelWithDebInfo[...]，
+    // 老版本的聚合任务 externalNativeBuild<Variant> 未必存在，两种都匹配。
+    val nativeTasks = tasks.names.filter {
+        it.startsWith("buildCMake") || it.startsWith("externalNativeBuild")
+    }
+    println("copyScannerRoot 将等待 ${nativeTasks.size} 个 CMake 任务: $nativeTasks")
 
-    // 复制动作必须排在所有 CMake 产物生成之后
     tasks.named("copyScannerRoot").configure {
-        mustRunAfter(*nativeTaskNames.toTypedArray())
+        // 用 dependsOn 而不是 mustRunAfter：后者在目标任务不在执行图里时不产生任何约束，
+        // 会让复制动作跑在 CMake 之前，扫描到空目录。
+        dependsOn(*nativeTasks.toTypedArray())
     }
 
-    // 每个变体的资源合并都要先等对应的 CMake 构建 + 复制完成
     listOf("Debug", "Release", "Profile").forEach { variant ->
         val mergeTask = tasks.findByName("merge${variant}Assets") ?: return@forEach
-        val nativeTask = tasks.findByName("externalNativeBuild$variant")
-        if (nativeTask != null) {
-            mergeTask.dependsOn(nativeTask)
-        }
         mergeTask.dependsOn("copyScannerRoot")
         println("✅ merge${variant}Assets 已串上 copyScannerRoot")
     }

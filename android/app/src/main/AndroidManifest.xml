@@ -48,6 +48,16 @@
             android:exported="false"
             android:foregroundServiceType="specialUse"/>
 
+        <!-- MCP 服务：对外提供内存操作接口，供 Claude Code / Codex 等 MCP 客户端连接 -->
+        <service
+            android:name=".mcp.McpService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="为本机 AI 客户端提供内存分析与修改的本地服务接口"/>
+        </service>
+
         <!-- 悬浮窗 Flutter Activity -->
         <activity
             android:name=".OverlayFlutterActivity"

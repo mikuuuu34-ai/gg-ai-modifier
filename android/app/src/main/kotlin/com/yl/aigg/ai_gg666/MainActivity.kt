@@ -9,6 +9,9 @@ import android.os.Build
 import android.provider.Settings
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.yl.aigg.ai_gg666.mcp.McpCallLog
+import com.yl.aigg.ai_gg666.mcp.McpConfig
+import com.yl.aigg.ai_gg666.mcp.McpService
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -341,6 +344,75 @@ class MainActivity : FlutterActivity() {
                 // Native 库状态检查
                 "checkNativeStatus" -> {
                     result.success(MemoryEngine.isNativeAvailable())
+                }
+
+                // ==================== MCP 服务 ====================
+
+                "mcpStatus" -> {
+                    McpConfig.init(applicationContext)
+                    result.success(
+                        mapOf(
+                            "running" to McpService.isRunning(),
+                            "port" to McpConfig.port,
+                            "token" to McpConfig.token,
+                            "readOnly" to McpConfig.readOnly,
+                            "lanEnabled" to McpConfig.lanEnabled,
+                            "autoStart" to McpConfig.autoStart,
+                            "localEndpoint" to McpConfig.localEndpoint(),
+                            "lanEndpoint" to McpConfig.lanEndpoint(),
+                            "lastError" to McpService.getLastError()
+                        )
+                    )
+                }
+
+                "mcpStart" -> {
+                    try {
+                        McpConfig.init(applicationContext)
+                        McpService.start(applicationContext)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("MCP_START_ERROR", e.message, null)
+                    }
+                }
+
+                "mcpStop" -> {
+                    try {
+                        McpService.stop(applicationContext)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("MCP_STOP_ERROR", e.message, null)
+                    }
+                }
+
+                "mcpSetConfig" -> {
+                    try {
+                        McpConfig.init(applicationContext)
+                        McpConfig.update(
+                            port = call.argument<Int>("port"),
+                            lanEnabled = call.argument<Boolean>("lanEnabled"),
+                            readOnly = call.argument<Boolean>("readOnly"),
+                            autoStart = call.argument<Boolean>("autoStart")
+                        )
+                        // 端口或绑定地址变了需要重启服务才生效
+                        val needRestart = call.argument<Boolean>("restart") ?: false
+                        if (needRestart && McpService.isRunning()) {
+                            McpService.stop(applicationContext)
+                            Thread.sleep(300)
+                            McpService.start(applicationContext)
+                        }
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("MCP_CONFIG_ERROR", e.message, null)
+                    }
+                }
+
+                "mcpRegenerateToken" -> {
+                    McpConfig.init(applicationContext)
+                    result.success(McpConfig.regenerateToken())
+                }
+
+                "mcpCallLog" -> {
+                    result.success(McpCallLog.recent(call.argument<Int>("limit") ?: 30))
                 }
 
                 // 悬浮窗
