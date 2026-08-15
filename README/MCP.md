@@ -141,6 +141,11 @@ gg_freeze          需要的话锁住，防止游戏改回去
   （Claude Code 可用 `MCP_TOOL_TIMEOUT` 环境变量）。
 - **`gg_run_lua` 是无人值守模式**：`gg.choice` / `gg.prompt` / `gg.alert` 不会弹窗，
   而是立即返回默认值并在输出里标注。依赖交互分支的脚本行为会与手动执行不同。
+- **Lua 里的搜索只能看到前 500 条**：`gg.searchNumber` 走的是给界面用的旧同步接口，
+  单页上限 500，`gg.getResultsCount()` 返回的也是这个数而非真实命中数，
+  后续 `gg.refineNumber` 同样只在这 500 条里过滤。
+  这是 Lua 桥接层的固有限制（旧版扫描器本来就硬截断在 500，可见范围没变）。
+  需要完整结果集请改用 `gg_search` + `gg_refine`。
 - **未知初值的模糊搜索**：首轮建议用 `gg_search mode=range` 圈定一个合理区间
   （例如血量 0~10000），再配合 `gg_refine mode=fuzzy` 按增减收敛。
   直接对全类型值域做首轮模糊搜索会命中过多并触发截断。

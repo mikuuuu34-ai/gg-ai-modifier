@@ -294,7 +294,9 @@ object McpTools {
                 "执行一段 GG 兼容的 Lua 脚本（gg.searchNumber / gg.getResults / gg.setValues 等）。" +
                         "以无人值守方式运行：gg.choice / gg.prompt / gg.alert 不会弹窗，" +
                         "而是立即返回默认值并在输出里标注，因此依赖交互分支的脚本行为会与手动执行不同。" +
-                        "只读模式下会被拒绝。",
+                        "**注意 gg.searchNumber 最多只能看到 500 条命中**（Lua 桥接层的固有上限，" +
+                        "不是真实命中数），后续 gg.refineNumber 也只在这 500 条里过滤；" +
+                        "需要完整结果请改用 gg_search + gg_refine。只读模式下会被拒绝。",
                 JSONObject().put("script", p("string", "Lua 脚本内容")),
                 listOf("script")
             )
