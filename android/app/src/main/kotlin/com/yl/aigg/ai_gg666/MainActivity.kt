@@ -40,7 +40,13 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
 
         channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.yl.aigg/bridge")
-        
+
+        // 若用户开了「随 App 启动」，这里把 MCP 服务拉起来
+        McpConfig.init(applicationContext)
+        if (McpConfig.autoStart && !McpService.isRunning()) {
+            McpService.start(applicationContext)
+        }
+
         // 首次启动时申请权限
         requestAllPermissionsOnFirstLaunch()
 

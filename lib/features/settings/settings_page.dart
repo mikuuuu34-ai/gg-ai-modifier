@@ -8,6 +8,7 @@ import 'package:http/http.dart' as http;
 import '../../core/llm/llm_config.dart';
 import '../../core/llm/prompt_builder.dart';
 import '../../main.dart';
+import '../mcp/mcp_page.dart';
 
 /// LLM 配置 Provider
 final llmConfigProvider = StateProvider<LlmConfig>((ref) {
@@ -544,6 +545,27 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           _buildSectionTitle('🎮 悬浮窗'),
           const SizedBox(height: 12),
           _buildOverlayCard(),
+          const SizedBox(height: 24),
+
+          // MCP 服务
+          _buildSectionTitle('🔌 MCP 服务'),
+          const SizedBox(height: 12),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.hub_outlined, color: Color(0xFF8D6E63)),
+              title: const Text('接入 Claude Code / Codex'),
+              subtitle: const Text(
+                '把内存搜索与修改能力开放给外部 AI 客户端，由它们负责推理和收敛',
+                style: TextStyle(fontSize: 12, color: Color(0xFF8D6E63)),
+              ),
+              trailing: const Icon(Icons.chevron_right, color: Color(0xFFA1887F)),
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const McpPage()),
+                );
+              },
+            ),
+          ),
           const SizedBox(height: 24),
 
           // Root 权限

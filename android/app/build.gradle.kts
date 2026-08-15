@@ -79,27 +79,42 @@ tasks.register("copyScannerRoot") {
         val buildDirFile = layout.buildDirectory.get().asFile
         val abiList = setOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
 
-        // AGP 8 的 release 变体，CMake 构建类型目录叫 RelWithDebInfo 而不是 Release，
-        // 目录层级也随版本变动。与其枚举名字，不如把整棵中间产物树扫一遍取最新的那份。
+        // AGP 8 的 CMake 中间产物目录按 Gradle 变体命名（debug/profile/release），
+        // 层级还随版本变动。与其枚举路径，不如整棵树扫一遍再按变体优先级挑。
         val searchRoots = listOf(
             File(buildDirFile, "intermediates/cxx"),
             File(buildDirFile, "intermediates/cmake")
         ).filter { it.exists() }
 
-        val newest = HashMap<String, File>()
+        // 打的是 release 包，就该用 release 变体的产物；
+        // 仅按修改时间取最新会挑到碰巧最后编完的 profile 产物。
+        fun rank(path: String): Int {
+            val p = path.lowercase()
+            return when {
+                p.contains("/release/") || p.contains("relwithdebinfo") -> 3
+                p.contains("/profile/") -> 2
+                p.contains("/debug/") -> 1
+                else -> 0
+            }
+        }
+
+        val best = HashMap<String, File>()
         searchRoots.forEach { root ->
             root.walkTopDown().forEach { f ->
                 if (f.isFile && f.name == "scanner_root") {
                     val abi = f.parentFile?.name
                     if (abi != null && abi in abiList) {
-                        val prev = newest[abi]
-                        if (prev == null || f.lastModified() > prev.lastModified()) newest[abi] = f
+                        val prev = best[abi]
+                        val better = prev == null ||
+                                rank(f.path) > rank(prev.path) ||
+                                (rank(f.path) == rank(prev.path) && f.lastModified() > prev.lastModified())
+                        if (better) best[abi] = f
                     }
                 }
             }
         }
 
-        if (newest.isEmpty()) {
+        if (best.isEmpty()) {
             println("搜索过的目录: ${searchRoots.joinToString { it.absolutePath }}")
             throw GradleException(
                 "copyScannerRoot 没有找到任何 ABI 的 scanner_root 产物。" +
@@ -109,7 +124,7 @@ tasks.register("copyScannerRoot") {
         }
 
         abiList.forEach { abi ->
-            val src = newest[abi]
+            val src = best[abi]
             if (src == null) {
                 println("⚠️ copyScannerRoot: 未找到 $abi 的产物，该 ABI 仍是仓库里的旧二进制")
                 return@forEach
