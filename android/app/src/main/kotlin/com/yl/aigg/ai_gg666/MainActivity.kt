@@ -399,12 +399,13 @@ class MainActivity : FlutterActivity() {
                             readOnly = call.argument<Boolean>("readOnly"),
                             autoStart = call.argument<Boolean>("autoStart")
                         )
-                        // 端口或绑定地址变了需要重启服务才生效
+                        // 只有端口和绑定地址需要重新绑定 socket；
+                        // readOnly 是每次工具调用时实时读的，改它不必重启。
                         val needRestart = call.argument<Boolean>("restart") ?: false
                         if (needRestart && McpService.isRunning()) {
-                            McpService.stop(applicationContext)
-                            Thread.sleep(300)
-                            McpService.start(applicationContext)
+                            // 交给 Service 在后台线程完成停+启，
+                            // 不在主线程上 sleep，也不靠两条 intent 的时序碰运气
+                            McpService.restart(applicationContext)
                         }
                         result.success(true)
                     } catch (e: Exception) {

@@ -404,7 +404,9 @@ class _McpPageState extends State<McpPage> {
                   );
                   if (!ok) return;
                 }
-                await _setConfig(readOnly: v, restart: true);
+                // readOnly 由每次工具调用实时读取，不需要重启服务。
+                // 早期版本这里传了 restart:true，反而会把正在运行的服务弄挂。
+                await _setConfig(readOnly: v);
               },
             ),
             const Divider(height: 1),
