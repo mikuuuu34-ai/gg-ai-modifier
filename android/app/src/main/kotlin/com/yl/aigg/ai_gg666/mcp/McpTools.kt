@@ -101,7 +101,14 @@ object McpTools {
             )
         )
 
-        tools.put(tool("gg_detach", "解除附加，释放扫描器与结果集。", JSONObject(), emptyList()))
+        tools.put(
+            tool(
+                "gg_detach",
+                "解除对当前进程的附加，释放扫描器与全部结果集。" +
+                        "换目标游戏、或目标进程已退出导致读取持续失败时调用。",
+                JSONObject(), emptyList()
+            )
+        )
 
         tools.put(
             tool(

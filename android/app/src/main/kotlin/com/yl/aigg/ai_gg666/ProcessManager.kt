@@ -28,8 +28,10 @@ object ProcessManager {
             val installedApps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
             appInfoCache = installedApps.associateBy { it.packageName }
 
-            // 使用 ps 命令快速获取运行中的进程
-            val psResult = RootManager.executeRootCommand("ps -A -o PID,NAME")
+            // 用 ARGS 而不是 NAME：NAME 取的是内核 comm，硬限 15 字节，
+            // com.android.chrome 会被截成 .android.chrome，按包名根本找不到目标。
+            // ARGS 取的是完整 cmdline。
+            val psResult = RootManager.executeRootCommand("ps -A -o PID,ARGS")
             if (psResult != null) {
                 for (line in psResult.lines()) {
                     if (line.isBlank() || line.startsWith("PID")) continue
@@ -37,9 +39,13 @@ object ProcessManager {
                     if (parts.size < 2) continue
 
                     val pid = parts[0].toIntOrNull() ?: continue
-                    val packageName = parts[1].trim()
+                    // cmdline 可能带参数，进程名只取第一段
+                    val packageName = parts[1].trim().substringBefore(' ').trim()
 
-                    if (packageName.isEmpty() || !packageName.contains(".")) continue
+                    if (packageName.isEmpty()) continue
+                    // 内核线程形如 [kthreadd] / [irq/16-...]，没有用户态内存可扫
+                    if (packageName.startsWith("[")) continue
+                    if (!packageName.contains(".")) continue
 
                     // 获取 APP 名称
                     val appName = getAppName(pm, packageName)
